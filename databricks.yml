@@ -1,0 +1,22 @@
+bundle:
+  name: realtime-transcription-demo
+
+sync:
+  include:
+    - .build
+
+artifacts:
+  default:
+    build: apx build && mkdir -p .build/wheels vendor/python-wheels && if ls vendor/python-wheels/*.whl >/dev/null 2>&1; then cp -f vendor/python-wheels/*.whl .build/wheels/; fi && (ls .build/wheels/*pyaudio*cp311*manylinux*.whl >/dev/null 2>&1 || docker run --rm --platform linux/amd64 -v "$PWD":/io quay.io/pypa/manylinux2014_x86_64 /bin/bash -lc 'set -euo pipefail; yum -y install portaudio-devel >/dev/null; /opt/python/cp311-cp311/bin/python -m pip install -U pip wheel setuptools auditwheel >/dev/null; /opt/python/cp311-cp311/bin/pip wheel --no-deps PyAudio==0.2.14 -w /tmp/wheelhouse >/dev/null; WHEEL=$(ls /tmp/wheelhouse/*pyaudio*cp311*linux_x86_64.whl); auditwheel repair "$WHEEL" -w /io/.build/wheels >/dev/null') && (ls .build/wheels/openai_whisper-20240930-*.whl >/dev/null 2>&1 || python -m pip wheel --no-deps --no-build-isolation --wheel-dir .build/wheels "openai-whisper==20240930") && cp -f .build/wheels/*.whl vendor/python-wheels/ && WHL=$(basename .build/*.whl) && { echo "$WHL"; echo "--find-links ./wheels"; echo "--only-binary=PyAudio,openai-whisper"; echo "PyAudio==0.2.14"; echo "openai-whisper==20240930"; cat requirements.app.txt; } > .build/requirements.txt
+
+resources:
+  apps:
+    realtime-transcription-demo-app:
+      name: "realtime-transcription-demo"
+      description: "realtime-transcription-demo created with apx"
+      source_code_path: ./.build
+
+targets:
+  dev:
+    mode: development
+    default: true

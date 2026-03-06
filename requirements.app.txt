@@ -1,0 +1,7 @@
+fastapi>=0.119.0
+pydantic-settings>=2.11.0
+uvicorn>=0.37.0
+databricks-sdk>=0.74.0
+websockets>=14.0
+setuptools>=70,<82; platform_system == "Linux"
+whisper-live>=0.7.0; platform_system == "Linux"

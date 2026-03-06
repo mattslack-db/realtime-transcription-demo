@@ -1,0 +1,1 @@
+command: ["sh", "-c", "PYTHONPATH=src:$PYTHONPATH uvicorn realtime_transcription_demo.backend.app:app --workers 1"]
