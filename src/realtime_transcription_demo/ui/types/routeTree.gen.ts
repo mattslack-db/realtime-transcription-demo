@@ -9,17 +9,17 @@
 // Additionally, you should also exclude this file from your linter and/or formatter to prevent it from being checked or modified.
 
 import { Route as rootRouteImport } from './../routes/__root'
-import { Route as SidebarRouteRouteImport } from './../routes/_sidebar/route'
 import { Route as IndexRouteImport } from './../routes/index'
+import { Route as SidebarRouteRouteImport } from './../routes/_sidebar/route'
 import { Route as SidebarWhisperliveRouteImport } from './../routes/_sidebar/whisperlive'
 
-const SidebarRouteRoute = SidebarRouteRouteImport.update({
-  id: '/_sidebar',
-  getParentRoute: () => rootRouteImport,
-} as any)
 const IndexRoute = IndexRouteImport.update({
   id: '/',
   path: '/',
+  getParentRoute: () => rootRouteImport,
+} as any)
+const SidebarRouteRoute = SidebarRouteRouteImport.update({
+  id: '/_sidebar',
   getParentRoute: () => rootRouteImport,
 } as any)
 const SidebarWhisperliveRoute = SidebarWhisperliveRouteImport.update({
@@ -57,18 +57,18 @@ export interface RootRouteChildren {
 
 declare module '@tanstack/react-router' {
   interface FileRoutesByPath {
-    '/_sidebar': {
-      id: '/_sidebar'
-      path: ''
-      fullPath: '/'
-      preLoaderRoute: typeof SidebarRouteRouteImport
-      parentRoute: typeof rootRouteImport
-    }
     '/': {
       id: '/'
       path: '/'
       fullPath: '/'
       preLoaderRoute: typeof IndexRouteImport
+      parentRoute: typeof rootRouteImport
+    }
+    '/_sidebar': {
+      id: '/_sidebar'
+      path: ''
+      fullPath: '/'
+      preLoaderRoute: typeof SidebarRouteRouteImport
       parentRoute: typeof rootRouteImport
     }
     '/_sidebar/whisperlive': {

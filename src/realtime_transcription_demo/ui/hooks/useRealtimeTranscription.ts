@@ -20,6 +20,26 @@ export interface TranscriptionLogEntry {
   level: "info" | "error";
 }
 
+/**
+ * A single WhisperLive segment. The server sends the last N completed segments
+ * plus the current in-progress (incomplete) one on every update. `start`/`end`
+ * are stable string timestamps (seconds, 3dp); `completed` marks finalized text.
+ */
+interface WhisperLiveSegment {
+  start?: string;
+  end?: string;
+  text?: string;
+  completed?: boolean;
+}
+
+interface WhisperLiveMessage {
+  text?: string;
+  error?: string;
+  status?: string;
+  message?: string;
+  segments?: WhisperLiveSegment[];
+}
+
 const SAMPLE_RATE = 16000;
 const CHUNK_MS = 100;
 const CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_MS) / 1000;
@@ -27,6 +47,28 @@ const CHUNK_SAMPLES = (SAMPLE_RATE * CHUNK_MS) / 1000;
 const DEBUG = import.meta.env.DEV;
 function log(msg: string, ...args: unknown[]) {
   if (DEBUG) console.log(`[transcribe] ${msg}`, ...args);
+}
+
+/**
+ * Linear-interpolation downsampler from an arbitrary input rate to SAMPLE_RATE.
+ * Browsers are not guaranteed to honor the requested AudioContext sampleRate,
+ * so we must resample to 16 kHz before tagging the PCM as 16 kHz. A no-op when
+ * the context already runs at the target rate.
+ */
+function resampleTo16k(input: Float32Array, inputRate: number): Float32Array {
+  if (inputRate === SAMPLE_RATE) return input;
+  const ratio = inputRate / SAMPLE_RATE;
+  const outLength = Math.floor(input.length / ratio);
+  const output = new Float32Array(outLength);
+  for (let i = 0; i < outLength; i++) {
+    const srcPos = i * ratio;
+    const idx = Math.floor(srcPos);
+    const frac = srcPos - idx;
+    const a = input[idx];
+    const b = idx + 1 < input.length ? input[idx + 1] : a;
+    output[i] = a + (b - a) * frac;
+  }
+  return output;
 }
 
 const WS_OPEN_TIMEOUT_MS = 10_000;
@@ -102,6 +144,9 @@ export function useRealtimeTranscription() {
   const startTimeRef = useRef<number>(0);
   const firstTokenTimeRef = useRef<number | null>(null);
   const isIntentionalStopRef = useRef(false);
+  // Completed segments keyed by their (stable) start timestamp. Preserves text
+  // even after a segment scrolls out of WhisperLive's send_last_n_segments window.
+  const committedSegmentsRef = useRef<Map<string, string>>(new Map());
 
   const appendLog = useCallback(
     (message: string, level: "info" | "error" = "info") => {
@@ -137,6 +182,63 @@ export function useRealtimeTranscription() {
     appendLog("Recording stopped");
   }, [appendLog]);
 
+  const applySegments = useCallback(
+    (incoming: WhisperLiveSegment[]) => {
+      const committed = committedSegmentsRef.current;
+      let interimText = "";
+      let sawContent = false;
+      incoming.forEach((seg, i) => {
+        const text = (seg.text ?? "").trim();
+        if (!text) return;
+        sawContent = true;
+        if (seg.completed) {
+          // Key on the stable start timestamp so refinements replace, not duplicate.
+          committed.set(seg.start ?? `pos-${i}`, text);
+        } else {
+          interimText = interimText ? `${interimText} ${text}` : text;
+        }
+      });
+      if (!sawContent) return;
+
+      // First token latency is only meaningful once audio has started flowing.
+      if (startTimeRef.current > 0 && firstTokenTimeRef.current === null) {
+        firstTokenTimeRef.current = Date.now();
+      }
+
+      const orderedCommitted = Array.from(committed.entries()).sort(
+        (a, b) => Number.parseFloat(a[0]) - Number.parseFloat(b[0]),
+      );
+      const finalText = orderedCommitted.map(([, t]) => t).join(" ");
+
+      setTranscript(finalText);
+      setInterim(interimText);
+      setSegments([
+        ...orderedCommitted.map(([, t]) => ({ text: t, isFinal: true })),
+        ...(interimText ? [{ text: interimText, isFinal: false }] : []),
+      ]);
+      setMetrics((m) => ({
+        ...m,
+        timeToFirstTokenMs:
+          firstTokenTimeRef.current !== null && startTimeRef.current > 0
+            ? firstTokenTimeRef.current - startTimeRef.current
+            : m.timeToFirstTokenMs,
+        // Count distinct real segments, not raw messages: WhisperLive re-sends the
+        // rolling window plus the in-progress segment on every update.
+        segmentCount: committed.size + (interimText ? 1 : 0),
+        lastSegmentAt: Date.now(),
+      }));
+
+      // Detect the spoken "stop recording" command on the newest segment only,
+      // so a stale earlier mention in the accumulated transcript can't re-trigger it.
+      const latest = (incoming[incoming.length - 1]?.text ?? "").trim();
+      if (/\bstop\s+recording\b/i.test(latest)) {
+        appendLog("Detected spoken 'stop recording' command, ending session");
+        stopRecording();
+      }
+    },
+    [appendLog, stopRecording],
+  );
+
   const startRecording = useCallback(async () => {
     try {
       isIntentionalStopRef.current = false;
@@ -147,7 +249,10 @@ export function useRealtimeTranscription() {
       setLogs([]);
       setMetrics({ timeToFirstTokenMs: null, segmentCount: 0, lastSegmentAt: null });
       firstTokenTimeRef.current = null;
-      startTimeRef.current = Date.now();
+      committedSegmentsRef.current = new Map();
+      // Sentinel: the "clock" starts when the first audio chunk is actually sent,
+      // so time-to-first-token excludes mic-permission and WS-connect latency.
+      startTimeRef.current = 0;
       appendLog("Starting whisperlive transcription");
 
       log("requesting microphone");
@@ -224,56 +329,25 @@ export function useRealtimeTranscription() {
 
       ws.onmessage = (event) => {
         if (typeof event.data !== "string") return;
+        let data: WhisperLiveMessage;
         try {
-          const data = JSON.parse(event.data) as {
-            text?: string;
-            is_final?: boolean;
-            error?: string;
-            status?: string;
-            segments?: Array<{ text?: string }>;
-            message?: string;
-          };
-          if (data.error) {
-            setError(data.error);
-            appendLog(data.error, "error");
-            return;
-          }
-          if (data.status === "ERROR" && data.message) {
-            setError(data.message);
-            appendLog(data.message, "error");
-            return;
-          }
-          // WhisperLive sends { segments } or { message } payloads.
-          const text =
-            data.text ??
-            data.message ??
-            (Array.isArray(data.segments) ? data.segments.map((s) => s.text).filter(Boolean).join(" ") : "");
-          if (text && String(text).trim()) {
-            const normalized = String(text).trim();
-            if (firstTokenTimeRef.current === null) {
-              firstTokenTimeRef.current = Date.now();
-            }
-            const isFinal = data.is_final ?? false;
-            setSegments((prev) => [...prev.slice(-200), { text: normalized, isFinal, timestamp: Date.now() }]);
-            if (isFinal) {
-              setTranscript((prev) => (prev ? prev + " " + normalized : normalized));
-              setInterim("");
-            } else {
-              setInterim(normalized);
-            }
-            setMetrics((m) => ({
-              ...m,
-              timeToFirstTokenMs: firstTokenTimeRef.current ? firstTokenTimeRef.current - startTimeRef.current : null,
-              segmentCount: m.segmentCount + 1,
-              lastSegmentAt: Date.now(),
-            }));
-            if (/\bstop\s+recording\b/i.test(normalized)) {
-              appendLog("Detected spoken 'stop recording' command, ending session");
-              stopRecording();
-            }
-          }
+          data = JSON.parse(event.data) as WhisperLiveMessage;
         } catch {
           appendLog("Received non-JSON transcription message", "error");
+          return;
+        }
+        if (data.error) {
+          setError(data.error);
+          appendLog(data.error, "error");
+          return;
+        }
+        if (data.status === "ERROR" && data.message) {
+          setError(data.message);
+          appendLog(data.message, "error");
+          return;
+        }
+        if (Array.isArray(data.segments) && data.segments.length > 0) {
+          applySegments(data.segments);
         }
       };
 
@@ -294,8 +368,10 @@ export function useRealtimeTranscription() {
 
       log("WebSocket open, starting audio pipeline", { url: ws.url });
 
-      // WhisperLive config is sent by backend proxy. We stream PCM after.
-      // Resample to 16 kHz mono and send 16-bit PCM. Buffer so we send full CHUNK_SAMPLES (no drop).
+      // WhisperLive config is sent by backend proxy. We stream 16-bit PCM after,
+      // resampled to 16 kHz mono. Buffer so we send full CHUNK_SAMPLES chunks.
+      const inputRate = context.sampleRate;
+      log("audio pipeline started", { inputRate, targetRate: SAMPLE_RATE });
       const source = context.createMediaStreamSource(stream);
       const chunkBuffer = new ArrayBuffer(CHUNK_SAMPLES * 2);
       const chunkView = new Int16Array(chunkBuffer);
@@ -304,13 +380,16 @@ export function useRealtimeTranscription() {
       let chunksSent = 0;
       let lastLogAt = 0;
 
+      // Sends exactly one CHUNK_SAMPLES chunk; callers guarantee that length.
       const flushChunk = (samples: number[]) => {
-        for (let i = 0; i < samples.length; i++) {
+        for (let i = 0; i < CHUNK_SAMPLES; i++) {
           const s = Math.max(-1, Math.min(1, samples[i]));
           chunkView[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
         }
         if (ws.readyState === WebSocket.OPEN) {
-          ws.send(samples.length < CHUNK_SAMPLES ? chunkBuffer.slice(0, samples.length * 2) : chunkBuffer);
+          // Start the time-to-first-token clock when the first audio actually ships.
+          if (startTimeRef.current === 0) startTimeRef.current = Date.now();
+          ws.send(chunkBuffer);
           chunksSent++;
           const now = Date.now();
           if (now - lastLogAt >= 5000) {
@@ -330,7 +409,9 @@ export function useRealtimeTranscription() {
         if (context.state === "closed") return;
         if (ws.readyState !== WebSocket.OPEN) return;
 
-        const input = e.inputBuffer.getChannelData(0);
+        // Resample to 16 kHz before buffering so chunk timing/labeling is correct
+        // even when the browser opens the context at its own hardware rate.
+        const input = resampleTo16k(e.inputBuffer.getChannelData(0), inputRate);
         for (let i = 0; i < input.length; i++) leftover.push(input[i]);
         // Drop oldest samples if buffer grows too large (e.g. WS stalled)
         if (leftover.length > MAX_LEFTOVER) {
@@ -365,7 +446,7 @@ export function useRealtimeTranscription() {
       appendLog(msg, "error");
       stopRecording();
     }
-  }, [appendLog, stopRecording]);
+  }, [appendLog, stopRecording, applySegments]);
 
   const displayTranscript = [transcript, interim].filter(Boolean).join(" ");
 
