@@ -6,7 +6,7 @@
  */
 import { chromium } from 'playwright';
 
-const BASE = 'https://realtime-transcription-demo-7474647258746543.aws.databricksapps.com';
+const BASE = process.env.APP_BASE_URL || 'https://realtime-transcription-demo-7474647152304469.aws.databricksapps.com';
 
 async function main() {
   const browser = await chromium.launch({ headless: true });
