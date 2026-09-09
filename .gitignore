@@ -37,5 +37,8 @@ node_modules/
 # apx
 .apx/
 
+# isaac tooling
+.isaac/
+
 # UI dist folder
 src/realtime_transcription_demo/__dist__/
